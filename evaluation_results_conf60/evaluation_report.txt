@@ -1,0 +1,35 @@
+============================================================
+  ACCIDENT DETECTION – EVALUATION REPORT
+============================================================
+
+Model     : /Users/harshitchakravarti/My Data/accident-detection/accident_yolo26m/weights/best.pt
+Test set  : /Users/harshitchakravarti/My Data/accident-detection/yolo_dataset/images/test
+Images    : 558
+
+── YOLO val() Metrics (test split) ──
+  mAP@0.50      : 0.0960
+  mAP@0.50:0.95 : 0.0575
+  Precision     : 0.7073
+  Recall        : 0.1151
+
+── Box-level Metrics (IoU ≥ 0.50) ──
+  TP=30  FP=10  FN=222
+  Precision : 0.7500
+  Recall    : 0.1190
+  F1 Score  : 0.2055
+
+── Image-level Classification Report ──
+              precision    recall  f1-score   support
+
+ No Accident       0.58      0.99      0.74       306
+    Accident       0.93      0.15      0.25       252
+
+    accuracy                           0.61       558
+   macro avg       0.75      0.57      0.49       558
+weighted avg       0.74      0.61      0.52       558
+
+── Output Files ──
+  /Users/harshitchakravarti/My Data/accident-detection/evaluation_results_conf60/confusion_matrix.png
+  /Users/harshitchakravarti/My Data/accident-detection/evaluation_results_conf60/training_curves.png
+  /Users/harshitchakravarti/My Data/accident-detection/evaluation_results_conf60/sample_predictions_grid.png
+  /Users/harshitchakravarti/My Data/accident-detection/evaluation_results_conf60/per_image_results.csv
