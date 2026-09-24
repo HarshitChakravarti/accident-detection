@@ -12,6 +12,7 @@ import time
 import tempfile
 import subprocess
 from pathlib import Path
+from collections import deque
 
 import cv2
 import numpy as np
@@ -101,6 +102,41 @@ st.markdown("""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TEMPORAL SMOOTHER
+# ─────────────────────────────────────────────────────────────────────────────
+class TemporalSmoother:
+    """
+    Rolling-window multi-frame confirmation (no retraining needed).
+
+    Requires N consecutive frames all above conf threshold before confirming
+    an incident. Kills single-frame ghost detections (e.g. close cars) while
+    preserving real accidents which persist across many frames.
+    """
+
+    def __init__(self, window_size: int = 3):
+        self.window_size = window_size
+        self._window: deque = deque(maxlen=window_size)
+        self.confirmed_incidents = 0
+        self._was_confirmed = False
+
+    def update(self, detected: bool) -> bool:
+        """Return True when last N frames ALL had a detection."""
+        self._window.append(1 if detected else 0)
+        is_confirmed = (
+            len(self._window) == self.window_size
+            and sum(self._window) == self.window_size
+        )
+        if is_confirmed and not self._was_confirmed:
+            self.confirmed_incidents += 1
+        self._was_confirmed = is_confirmed
+        return is_confirmed
+
+    def reset(self):
+        self._window.clear()
+        self._was_confirmed = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MODEL LOADER (cached)
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading YOLO26m model…")
@@ -142,11 +178,12 @@ def pil_to_bytes(img: Image.Image, fmt="JPEG") -> bytes:
     return buf.getvalue()
 
 
-def run_on_video(model, video_path: str, conf: float, progress_bar, status_text):
+def run_on_video(model, video_path: str, conf: float, smoothing_window: int,
+                 progress_bar, status_text):
     """
-    Process video frame by frame.
-    Writes annotated frames with mp4v, then re-encodes to H.264 via ffmpeg
-    so the output plays inline in the browser.
+    Process video frame by frame with temporal smoothing.
+    - Raw detections (single frame) shown with YELLOW box
+    - Confirmed incidents (N consecutive frames) shown with RED box
     Returns (output_path, stats_dict).
     """
     cap = cv2.VideoCapture(video_path)
@@ -158,12 +195,12 @@ def run_on_video(model, video_path: str, conf: float, progress_bar, status_text)
     width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Raw output (mp4v — OpenCV compatible but not browser-compatible)
     raw_path = video_path + "_raw.mp4"
     fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
     writer   = cv2.VideoWriter(raw_path, fourcc, fps, (width, height))
 
-    frames_with_detection = 0
+    smoother = TemporalSmoother(window_size=smoothing_window)
+    frames_with_raw_detection = 0
     conf_scores_all = []
     frame_idx = 0
 
@@ -172,38 +209,54 @@ def run_on_video(model, video_path: str, conf: float, progress_bar, status_text)
         if not ret:
             break
 
-        annotated, boxes = run_on_image(model, frame, conf)
-        writer.write(annotated)
+        result = model.predict(frame, conf=conf, verbose=False)[0]
+        has_detection = result.boxes is not None and len(result.boxes) > 0
+        is_confirmed  = smoother.update(has_detection)
 
-        if boxes:
-            frames_with_detection += 1
-            for b in boxes:
-                conf_scores_all.append(float(b["Confidence"].strip("%")) / 100)
+        # Draw boxes — colour depends on confirmation state
+        if has_detection:
+            frames_with_raw_detection += 1
+            box_color = (0, 0, 255) if is_confirmed else (0, 215, 255)  # Red if confirmed, Yellow if raw
+            for box, conf_score in zip(
+                result.boxes.xyxy.cpu().numpy(),
+                result.boxes.conf.cpu().numpy(),
+            ):
+                x1, y1, x2, y2 = map(int, box[:4])
+                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                label = f"{'CONFIRMED' if is_confirmed else 'RAW'} {conf_score:.2f}"
+                cv2.putText(frame, label, (x1, y1 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
+                conf_scores_all.append(float(conf_score))
 
+        # Overlay status on frame
+        status_label = "INCIDENT CONFIRMED" if is_confirmed else ("Detection..." if has_detection else "")
+        if status_label:
+            cv2.putText(frame, status_label, (12, 36),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.1,
+                        (0, 0, 255) if is_confirmed else (0, 215, 255), 3)
+
+        writer.write(frame)
         frame_idx += 1
         pct = int((frame_idx / max(total_frames, 1)) * 100)
         progress_bar.progress(min(pct, 100))
-        status_text.text(f"Processing frame {frame_idx}/{total_frames}  |  Detections so far: {frames_with_detection}")
+        status_text.text(
+            f"Frame {frame_idx}/{total_frames}  |  "
+            f"Raw detections: {frames_with_raw_detection}  |  "
+            f"Confirmed incidents: {smoother.confirmed_incidents}"
+        )
 
     cap.release()
     writer.release()
 
-    # Re-encode to H.264 with ffmpeg so browser can play it inline
+    # Re-encode to H.264 for browser playback
     h264_path = video_path + "_out.mp4"
     status_text.text("Re-encoding to H.264 for browser playback…")
     subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", raw_path,
-            "-vcodec", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",   # enables progressive streaming
-            h264_path,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        ["ffmpeg", "-y", "-i", raw_path,
+         "-vcodec", "libx264", "-pix_fmt", "yuv420p",
+         "-movflags", "+faststart", h264_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    # Remove the raw intermediate file
     try:
         os.unlink(raw_path)
     except Exception:
@@ -213,13 +266,15 @@ def run_on_video(model, video_path: str, conf: float, progress_bar, status_text)
 
     stats = {
         "total_frames": total_frames,
-        "frames_with_detection": frames_with_detection,
-        "detection_rate": f"{frames_with_detection/max(total_frames,1):.1%}",
+        "raw_detections": frames_with_raw_detection,
+        "confirmed_incidents": smoother.confirmed_incidents,
+        "smoothing_window": smoothing_window,
         "avg_confidence": f"{np.mean(conf_scores_all):.2%}" if conf_scores_all else "N/A",
         "duration_sec": f"{total_frames/fps:.1f}s",
         "fps": f"{fps:.0f}",
     }
     return out_path, stats
+
 
 
 
@@ -232,8 +287,17 @@ with st.sidebar:
         "Confidence Threshold",
         min_value=0.30, max_value=0.90,
         value=0.60, step=0.05,
-        help="Only detections above this score are shown. 0.60 recommended — suppresses false positives on close vehicles.",
+        help="Only detections above this score are shown. 0.60 recommended.",
     )
+    smoothing_window = st.slider(
+        "Temporal Smoothing — N consecutive frames",
+        min_value=1, max_value=7, value=3, step=1,
+        help="Require N consecutive frames with a detection before confirming an incident. N=1 = no smoothing. Only applies to video.",
+    )
+    if smoothing_window == 1:
+        st.caption("ℹ️ Smoothing OFF — every single-frame detection counts")
+    else:
+        st.caption(f"✅ Smoothing ON — need **{smoothing_window}** consecutive frames to confirm")
 
     st.markdown("---")
     st.markdown("### 🤖 Model Info")
@@ -372,7 +436,7 @@ with tab_video:
 
             with st.spinner("Analysing video…"):
                 out_path, stats = run_on_video(
-                    model, tmp_path, conf_threshold,
+                    model, tmp_path, conf_threshold, smoothing_window,
                     progress_bar, status_text,
                 )
 
@@ -382,16 +446,21 @@ with tab_video:
             # ── Stats Banner ─────────────────────────────────────────────
             st.markdown("### 📊 Detection Summary")
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total Frames",     stats["total_frames"])
-            c2.metric("Frames w/ Accident", stats["frames_with_detection"])
-            c3.metric("Detection Rate",   stats["detection_rate"])
-            c4.metric("Avg Confidence",   stats["avg_confidence"])
+            c1.metric("Total Frames", stats["total_frames"])
+            c2.metric("Raw Detections", stats["raw_detections"],
+                      help="Frames where model fired above conf threshold (before smoothing)")
+            c3.metric(f"Confirmed Incidents (N={smoothing_window})", stats["confirmed_incidents"],
+                      help=f"Distinct incidents confirmed by {smoothing_window} consecutive frames")
+            c4.metric("Avg Confidence", stats["avg_confidence"])
 
-            st.caption(f"Duration: {stats['duration_sec']}  ·  FPS: {stats['fps']}  ·  Conf threshold: {conf_threshold}")
+            st.caption(
+                f"Duration: {stats['duration_sec']}  ·  FPS: {stats['fps']}  ·  "
+                f"Conf: {conf_threshold}  ·  Smoothing N={smoothing_window}"
+            )
 
-            if int(stats["frames_with_detection"]) > 0:
+            if stats["confirmed_incidents"] > 0:
                 st.markdown(
-                    f'<span class="badge-accident">🚨 Accident detected in {stats["frames_with_detection"]} frames</span>',
+                    f'<span class="badge-accident">🚨 {stats["confirmed_incidents"]} confirmed incident(s) — {stats["raw_detections"]} raw detections suppressed to {stats["confirmed_incidents"]} real events</span>',
                     unsafe_allow_html=True,
                 )
             else:
