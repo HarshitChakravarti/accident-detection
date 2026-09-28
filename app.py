@@ -23,8 +23,11 @@ from ultralytics import YOLO
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
-BASE_DIR   = Path(__file__).parent
-MODEL_PATH = BASE_DIR / "accident_yolo26m" / "weights" / "best.pt"
+BASE_DIR            = Path(__file__).parent
+MODEL_PATH          = BASE_DIR / "accident_yolo26m" / "weights" / "best.pt"
+VEHICLE_MODEL_PATH  = BASE_DIR / "yolov8n.pt"   # COCO model for vehicle detection/tracking
+VEHICLE_CLASSES     = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
+VEHICLE_CONF        = 0.35   # lower threshold fine for well-trained COCO model
 
 MODEL_STATS = {
     "Architecture": "YOLO26m",
@@ -137,11 +140,56 @@ class TemporalSmoother:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# VEHICLE TRACKER
+# ─────────────────────────────────────────────────────────────────────────────
+class VehicleTracker:
+    """
+    Maintains centroid history per ByteTrack vehicle ID.
+
+    Stopped vehicle logic:
+        If a vehicle's centroid has moved less than `stopped_px` pixels
+        over the last `stopped_seconds` seconds → flagged as STOPPED.
+
+    Also collects unique vehicle IDs seen across the clip for counting.
+    """
+
+    def __init__(self, fps: float, stopped_px: int = 15, stopped_seconds: float = 3.0):
+        self.fps = fps
+        self.stopped_px = stopped_px
+        self.history_len = max(1, int(fps * stopped_seconds))
+        # {track_id: deque of (cx, cy)}
+        self.histories: dict = {}
+        self.unique_ids: set = set()
+
+    def update(self, track_id: int, cx: float, cy: float) -> bool:
+        """Update centroid history. Returns True if vehicle is stopped."""
+        self.unique_ids.add(int(track_id))
+        tid = int(track_id)
+        if tid not in self.histories:
+            self.histories[tid] = deque(maxlen=self.history_len)
+        self.histories[tid].append((cx, cy))
+
+        hist = self.histories[tid]
+        if len(hist) < self.history_len:
+            return False   # not enough history yet
+
+        dx = hist[-1][0] - hist[0][0]
+        dy = hist[-1][1] - hist[0][1]
+        return (dx ** 2 + dy ** 2) ** 0.5 < self.stopped_px
+
+    def get_trail(self, track_id: int) -> list:
+        """Return list of (cx, cy) points for trail drawing."""
+        return list(self.histories.get(int(track_id), []))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MODEL LOADER (cached)
 # ─────────────────────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner="Loading YOLO26m model…")
-def load_model():
-    return YOLO(str(MODEL_PATH))
+@st.cache_resource(show_spinner="Loading models…")
+def load_models():
+    accident_model = YOLO(str(MODEL_PATH))           # best.pt — accident detection
+    vehicle_model  = YOLO(str(VEHICLE_MODEL_PATH))   # yolov8n — vehicle tracking
+    return accident_model, vehicle_model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -178,13 +226,22 @@ def pil_to_bytes(img: Image.Image, fmt="JPEG") -> bytes:
     return buf.getvalue()
 
 
-def run_on_video(model, video_path: str, conf: float, smoothing_window: int,
-                 progress_bar, status_text):
+def run_on_video(accident_model, vehicle_model, video_path: str,
+                 conf: float, smoothing_window: int,
+                 stopped_px: int, progress_bar, status_text):
     """
-    Process video frame by frame with temporal smoothing.
-    - Raw detections (single frame) shown with YELLOW box
-    - Confirmed incidents (N consecutive frames) shown with RED box
-    Returns (output_path, stats_dict).
+    Dual-model video pipeline:
+      • vehicle_model (yolov8n, COCO) → detects every car/truck/bus/motorcycle
+                                         ByteTrack assigns persistent IDs
+                                         VehicleTracker flags stopped vehicles
+      • accident_model (best.pt)      → detects Accident class only
+                                         TemporalSmoother confirms incidents
+
+    Colour coding on output video:
+        🟢 Green  = moving tracked vehicle
+        🟠 Orange = stopped / stalled vehicle
+        🔴 Red    = accident confirmed by N consecutive frames
+        🟡 Yellow = unconfirmed single-frame accident detection
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -199,50 +256,128 @@ def run_on_video(model, video_path: str, conf: float, smoothing_window: int,
     fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
     writer   = cv2.VideoWriter(raw_path, fourcc, fps, (width, height))
 
-    smoother = TemporalSmoother(window_size=smoothing_window)
-    frames_with_raw_detection = 0
-    conf_scores_all = []
+    smoother        = TemporalSmoother(window_size=smoothing_window)
+    vehicle_tracker = VehicleTracker(fps=fps, stopped_px=stopped_px, stopped_seconds=3.0)
+
+    frames_with_accident = 0
+    acc_conf_scores = []
     frame_idx = 0
+    max_stopped_simultaneously = 0
+
+    # Colour constants (BGR)
+    CLR_MOVING   = (0, 200, 80)    # Green
+    CLR_STOPPED  = (0, 140, 255)   # Orange
+    CLR_ACCIDENT = (0, 0, 255)     # Red
+    CLR_RAW      = (0, 215, 255)   # Yellow
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        result = model.predict(frame, conf=conf, verbose=False)[0]
-        has_detection = result.boxes is not None and len(result.boxes) > 0
-        is_confirmed  = smoother.update(has_detection)
+        # ── Layer 1: Vehicle detection + tracking (yolov8n) ──────────────
+        v_result = vehicle_model.track(
+            frame, conf=VEHICLE_CONF, persist=True,
+            tracker="bytetrack.yaml", verbose=False,
+            classes=list(VEHICLE_CLASSES.keys()),
+        )[0]
 
-        # Draw boxes — colour depends on confirmation state
-        if has_detection:
-            frames_with_raw_detection += 1
-            box_color = (0, 0, 255) if is_confirmed else (0, 215, 255)  # Red if confirmed, Yellow if raw
+        stopped_this_frame = 0
+
+        if v_result.boxes is not None and len(v_result.boxes) > 0:
+            v_track_ids = v_result.boxes.id
+            v_classes   = v_result.boxes.cls.int().cpu().numpy()
+
+            for i, box in enumerate(v_result.boxes.xyxy.cpu().numpy()):
+                x1, y1, x2, y2 = map(int, box[:4])
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+
+                tid        = int(v_track_ids[i]) if v_track_ids is not None else -1
+                cls_name   = VEHICLE_CLASSES.get(int(v_classes[i]), "vehicle")
+                is_stopped = vehicle_tracker.update(tid, cx, cy) if tid >= 0 else False
+
+                if is_stopped:
+                    stopped_this_frame += 1
+
+                color = CLR_STOPPED if is_stopped else CLR_MOVING
+
+                # Box
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+                # Label: class + ID + status
+                if is_stopped:
+                    tag = f"STOPPED {cls_name} #{tid}"
+                else:
+                    tag = f"{cls_name} #{tid}" if tid >= 0 else cls_name
+                cv2.putText(frame, tag, (x1, max(y1 - 8, 14)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2)
+
+                # Trail dots (last 25 centroids, fading)
+                if tid >= 0:
+                    trail = vehicle_tracker.get_trail(tid)
+                    for t_idx, (tx, ty) in enumerate(trail[-25:]):
+                        radius = max(1, 3 - t_idx // 8)
+                        cv2.circle(frame, (int(tx), int(ty)), radius, color, -1)
+
+        max_stopped_simultaneously = max(max_stopped_simultaneously, stopped_this_frame)
+
+        # ── Layer 2: Accident detection (best.pt) ────────────────────────
+        a_result = accident_model.predict(
+            frame, conf=conf, verbose=False
+        )[0]
+
+        has_accident = a_result.boxes is not None and len(a_result.boxes) > 0
+        is_confirmed = smoother.update(has_accident)
+
+        if has_accident:
+            frames_with_accident += 1
             for box, conf_score in zip(
-                result.boxes.xyxy.cpu().numpy(),
-                result.boxes.conf.cpu().numpy(),
+                a_result.boxes.xyxy.cpu().numpy(),
+                a_result.boxes.conf.cpu().numpy(),
             ):
                 x1, y1, x2, y2 = map(int, box[:4])
-                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                label = f"{'CONFIRMED' if is_confirmed else 'RAW'} {conf_score:.2f}"
-                cv2.putText(frame, label, (x1, y1 - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
-                conf_scores_all.append(float(conf_score))
+                acc_conf_scores.append(float(conf_score))
 
-        # Overlay status on frame
-        status_label = "INCIDENT CONFIRMED" if is_confirmed else ("Detection..." if has_detection else "")
-        if status_label:
-            cv2.putText(frame, status_label, (12, 36),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.1,
-                        (0, 0, 255) if is_confirmed else (0, 215, 255), 3)
+                color = CLR_ACCIDENT if is_confirmed else CLR_RAW
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+                tag = f"{'ACCIDENT' if is_confirmed else 'DETECTING'} {conf_score:.2f}"
+                cv2.putText(frame, tag, (x1, max(y1 - 10, 14)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+        # ── Top-left status overlay ──────────────────────────────────────
+        if is_confirmed:
+            cv2.putText(frame, "INCIDENT CONFIRMED", (12, 38),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.05, CLR_ACCIDENT, 3)
+        elif has_accident:
+            cv2.putText(frame, "Detecting...", (12, 38),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.05, CLR_RAW, 3)
+
+        # ── Colour legend (top-right) ────────────────────────────────────
+        legend = [
+            (CLR_MOVING,   "Moving"),
+            (CLR_STOPPED,  "Stopped"),
+            (CLR_ACCIDENT, "Accident"),
+        ]
+        for li, (lclr, ltxt) in enumerate(legend):
+            lx = width - 155
+            ly = 22 + li * 22
+            cv2.rectangle(frame, (lx, ly - 12), (lx + 14, ly + 2), lclr, -1)
+            cv2.putText(frame, ltxt, (lx + 18, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (230, 230, 230), 1)
+
+        # ── Vehicle count (bottom-left) ──────────────────────────────────
+        cv2.putText(frame, f"Vehicles seen: {len(vehicle_tracker.unique_ids)}",
+                    (10, height - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1)
 
         writer.write(frame)
         frame_idx += 1
-        pct = int((frame_idx / max(total_frames, 1)) * 100)
-        progress_bar.progress(min(pct, 100))
+        progress_bar.progress(min(int(frame_idx / max(total_frames, 1) * 100), 100))
         status_text.text(
             f"Frame {frame_idx}/{total_frames}  |  "
-            f"Raw detections: {frames_with_raw_detection}  |  "
-            f"Confirmed incidents: {smoother.confirmed_incidents}"
+            f"Vehicles: {len(vehicle_tracker.unique_ids)}  |  "
+            f"Stopped: {stopped_this_frame}  |  "
+            f"Incidents: {smoother.confirmed_incidents}"
         )
 
     cap.release()
@@ -266,14 +401,17 @@ def run_on_video(model, video_path: str, conf: float, smoothing_window: int,
 
     stats = {
         "total_frames": total_frames,
-        "raw_detections": frames_with_raw_detection,
+        "raw_detections": frames_with_accident,
         "confirmed_incidents": smoother.confirmed_incidents,
+        "unique_vehicles": len(vehicle_tracker.unique_ids),
+        "max_stopped": max_stopped_simultaneously,
         "smoothing_window": smoothing_window,
-        "avg_confidence": f"{np.mean(conf_scores_all):.2%}" if conf_scores_all else "N/A",
+        "avg_confidence": f"{np.mean(acc_conf_scores):.2%}" if acc_conf_scores else "N/A",
         "duration_sec": f"{total_frames/fps:.1f}s",
         "fps": f"{fps:.0f}",
     }
     return out_path, stats
+
 
 
 
@@ -299,6 +437,12 @@ with st.sidebar:
     else:
         st.caption(f"✅ Smoothing ON — need **{smoothing_window}** consecutive frames to confirm")
 
+    stopped_threshold_px = st.slider(
+        "Stopped Vehicle Threshold (px)",
+        min_value=5, max_value=40, value=15, step=5,
+        help="A tracked vehicle is flagged STOPPED if its centroid moves less than this many pixels over 3 seconds. Lower = more sensitive.",
+    )
+
     st.markdown("---")
     st.markdown("### 🤖 Model Info")
     for k, v in MODEL_STATS.items():
@@ -306,11 +450,14 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 📂 Weights")
-    weight_exists = MODEL_PATH.exists()
-    if weight_exists:
-        st.success(f"✅ `best.pt` loaded")
+    if MODEL_PATH.exists():
+        st.success("✅ `best.pt` — Accident detection")
     else:
-        st.error(f"❌ Model not found at `{MODEL_PATH}`")
+        st.error(f"❌ `best.pt` not found")
+    if VEHICLE_MODEL_PATH.exists():
+        st.success("✅ `yolov8n.pt` — Vehicle tracking")
+    else:
+        st.warning("⚠️ `yolov8n.pt` not found — will auto-download")
 
     st.markdown("---")
     st.caption("Accident Detection · YOLO26m · College Project Demo")
@@ -323,8 +470,8 @@ st.markdown('<p class="main-title">🚨 Accident Detection</p>', unsafe_allow_ht
 st.markdown('<p class="sub-title">Powered by YOLO26m · Upload an image or video to detect road accidents</p>', unsafe_allow_html=True)
 st.divider()
 
-# Load model
-model = load_model()
+# Load both models
+accident_model, vehicle_model = load_models()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TABS
@@ -355,7 +502,7 @@ with tab_image:
 
             with st.spinner("Running YOLO26m…"):
                 t0 = time.time()
-                annotated_bgr, boxes = run_on_image(model, img_bgr, conf_threshold)
+                annotated_bgr, boxes = run_on_image(accident_model, img_bgr, conf_threshold)
                 elapsed = time.time() - t0
 
             # ── Detection Banner ──────────────────────────────────────────
@@ -436,8 +583,9 @@ with tab_video:
 
             with st.spinner("Analysing video…"):
                 out_path, stats = run_on_video(
-                    model, tmp_path, conf_threshold, smoothing_window,
-                    progress_bar, status_text,
+                    accident_model, vehicle_model,
+                    tmp_path, conf_threshold, smoothing_window,
+                    stopped_threshold_px, progress_bar, status_text,
                 )
 
             progress_bar.progress(100)
@@ -445,27 +593,31 @@ with tab_video:
 
             # ── Stats Banner ─────────────────────────────────────────────
             st.markdown("### 📊 Detection Summary")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total Frames", stats["total_frames"])
-            c2.metric("Raw Detections", stats["raw_detections"],
-                      help="Frames where model fired above conf threshold (before smoothing)")
-            c3.metric(f"Confirmed Incidents (N={smoothing_window})", stats["confirmed_incidents"],
-                      help=f"Distinct incidents confirmed by {smoothing_window} consecutive frames")
-            c4.metric("Avg Confidence", stats["avg_confidence"])
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Total Frames",  stats["total_frames"])
+            c2.metric("🚗 Unique Vehicles", stats["unique_vehicles"],
+                      help="Distinct tracked vehicle IDs seen across the clip")
+            c3.metric("🟠 Stopped Vehicles", stats["max_stopped"],
+                      help="Peak number of simultaneously stopped/stalled vehicles")
+            c4.metric(f"🔴 Confirmed Incidents", stats["confirmed_incidents"],
+                      help=f"Accidents confirmed by {smoothing_window} consecutive frames")
+            c5.metric("Avg Confidence", stats["avg_confidence"])
 
             st.caption(
                 f"Duration: {stats['duration_sec']}  ·  FPS: {stats['fps']}  ·  "
-                f"Conf: {conf_threshold}  ·  Smoothing N={smoothing_window}"
+                f"Conf: {conf_threshold}  ·  Smoothing N={smoothing_window}  ·  "
+                f"Stop threshold: {stopped_threshold_px}px"
             )
 
             if stats["confirmed_incidents"] > 0:
                 st.markdown(
-                    f'<span class="badge-accident">🚨 {stats["confirmed_incidents"]} confirmed incident(s) — {stats["raw_detections"]} raw detections suppressed to {stats["confirmed_incidents"]} real events</span>',
+                    f'<span class="badge-accident">🚨 {stats["confirmed_incidents"]} confirmed incident(s) | '
+                    f'{stats["unique_vehicles"]} vehicles tracked | {stats["max_stopped"]} stopped vehicle(s) detected</span>',
                     unsafe_allow_html=True,
                 )
             else:
                 st.markdown(
-                    '<span class="badge-clear">✅ No Accidents Detected</span>',
+                    f'<span class="badge-clear">✅ No Accidents — {stats["unique_vehicles"]} vehicles tracked</span>',
                     unsafe_allow_html=True,
                 )
 
